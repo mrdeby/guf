@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+# Dữ liệu profile: chứa cookie đăng nhập, KHÔNG commit
+guf_data/
