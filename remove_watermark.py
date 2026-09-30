@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Xóa watermark tĩnh (vd. "Dola AI") khỏi video bằng OpenCV inpainting.
+"""Xóa watermark tĩnh (vd. "Veo", "Dola AI") khỏi video bằng OpenCV inpainting.
 
 Cách hoạt động:
-  1. Dò watermark: watermark đứng yên còn nội dung video thay đổi, nên các cạnh
-     (edge) xuất hiện ở cùng vị trí trong gần như mọi frame chính là watermark.
-     Chỉ tìm trong vùng góc (mặc định góc dưới-phải) để tránh nhầm với nền tĩnh.
-  2. Tạo mask từ các cạnh tĩnh đó, nới rộng để phủ cả chữ lẫn bóng đổ.
-  3. Inpaint từng frame bằng cv2.inpaint, ghi video mới rồi ghép lại audio gốc.
+  1. Dò watermark: lấy trung vị theo thời gian của vùng góc video. Nền chuyển
+     động bị nhòe đi, còn watermark đứng yên vẫn sắc nét -> lọc thông cao để
+     tách watermark. Mỗi preset (veo, dola) chỉ tìm trong một ô nhỏ ở góc.
+  2. Tạo mask từ vùng đó, nới rộng để phủ cả viền chữ lẫn bóng đổ.
+  3. Inpaint từng frame, ghi video mới rồi ghép lại audio gốc.
 
 Cài đặt:
   pip install opencv-contrib-python-headless numpy imageio-ffmpeg
@@ -14,11 +14,15 @@ Cài đặt:
    thì script tự dùng Telea)
 
 Sử dụng:
-  python remove_watermark.py input.mp4 output.mp4
+  python remove_watermark.py input.mp4 output.mp4 --preset veo
+  python remove_watermark.py input.mp4 output.mp4 --preset dola
+  python remove_watermark.py thu_muc_video/ thu_muc_ra/ --preset veo       # xử lý cả thư mục
+  python remove_watermark.py input.mp4 output.mp4                          # tự dò trong cả góc
   python remove_watermark.py input.mp4 output.mp4 --box 605 1232 100 34   # chỉ định vùng x y w h
   python remove_watermark.py input.mp4 output.mp4 --corner bottom-left --save-mask mask.png
 """
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -40,54 +44,103 @@ def ffmpeg_exe():
         return None
 
 
-def corner_roi(w, h, corner, frac_w=0.4, frac_h=0.12):
-    rw, rh = int(w * frac_w), int(h * frac_h)
+# Vùng tìm watermark cho từng loại (kích thước tính ở video 720p, tự co giãn theo
+# độ phân giải). "grow" = số pixel nới mask để phủ viền/bóng đổ.
+PRESETS = {
+    "veo":  {"corner": "bottom-right", "win": (140, 70), "grow": 4},
+    "dola": {"corner": "bottom-right", "win": (220, 100), "grow": 7},
+}
+
+
+def video_info(path):
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        sys.exit(f"Không mở được video: {path}")
+    info = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+            int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+    cap.release()
+    return info
+
+
+def search_window(w, h, corner, win=None):
+    """Vùng (x, y, w, h) để tìm watermark ở một góc của frame."""
+    if win:
+        s = min(w, h) / 720
+        rw, rh = min(int(win[0] * s), w), min(int(win[1] * s), h)
+    else:
+        rw, rh = int(w * 0.4), int(h * 0.12)
     x = w - rw if "right" in corner else 0
     y = h - rh if "bottom" in corner else 0
     return x, y, rw, rh
 
 
-def detect_mask(path, corner, samples=40, thresh=0.7):
-    """Trả về mask (uint8, 0/255) kích thước bằng frame, đánh dấu vùng watermark."""
+def detect_mask(path, corner, win=None, grow=6, samples=120):
+    """Trả về mask (uint8, 0/255) kích thước bằng frame, đánh dấu vùng watermark.
+
+    Ở mỗi frame lấy chi tiết cao tần (ảnh trừ ảnh mờ). Nền chuyển động nên chi
+    tiết của nó thay đổi liên tục; watermark đứng yên nên chi tiết gần như không
+    đổi. Điểm = trung bình / độ lệch chuẩn theo thời gian -> watermark nổi bật.
+    """
+    w, h, n = video_info(path)
+    rx, ry, rw, rh = search_window(w, h, corner, win)
+    s = min(w, h) / 720
+    sigma = 3 * s
+
     cap = cv2.VideoCapture(path)
-    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    rx, ry, rw, rh = corner_roi(w, h, corner)
-
-    idx = np.linspace(0, max(n - 1, 0), min(samples, max(n, 1))).astype(int)
-    edge_sum = np.zeros((rh, rw), np.float32)
-    used = 0
-    for i in idx:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
-        ok, frame = cap.read()
-        if not ok:
-            continue
-        gray = cv2.cvtColor(frame[ry:ry + rh, rx:rx + rw], cv2.COLOR_BGR2GRAY)
-        edges = cv2.Canny(gray, 30, 90)
-        # nới nhẹ để chịu được nhiễu nén giữa các frame
-        edge_sum += cv2.dilate(edges, np.ones((3, 3), np.uint8)) > 0
-        used += 1
+    step = max(1, n // samples)
+    hps = []
+    i = 0
+    while True:
+        if i % step:
+            if not cap.grab():
+                break
+        else:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            g = cv2.cvtColor(frame[ry:ry + rh, rx:rx + rw], cv2.COLOR_BGR2GRAY).astype(np.float32)
+            hps.append(g - cv2.GaussianBlur(g, (0, 0), sigma))
+        i += 1
     cap.release()
-    if used == 0:
-        sys.exit("Không đọc được frame nào từ video.")
+    if len(hps) < 2:
+        sys.exit("Video quá ngắn, không dò được watermark. Hãy dùng --box x y w h.")
 
-    static = ((edge_sum / used) >= thresh).astype(np.uint8) * 255
+    hps = np.array(hps)
+    # Chữ watermark sáng hơn xung quanh -> chỉ lấy phần dương.
+    # Ngưỡng kép: "strong" để chắc chắn là watermark, "weak" để lấy đủ phần chữ nhạt.
+    score = hps.mean(0) / (hps.std(0) + 2)
+    strong = score > max(0.25 * score.max(), 1.5)
+    weak = (score > max(0.1 * score.max(), 1.0)).astype(np.uint8) * 255
 
-    # Giữ các cụm cạnh tĩnh lớn nhất nằm gần nhau (chữ watermark), bỏ nhiễu lẻ
-    joined = cv2.morphologyEx(static, cv2.MORPH_CLOSE,
-                              cv2.getStructuringElement(cv2.MORPH_RECT, (15, 9)))
+    # Nối các chữ cái thành cụm
+    k = max(3, int(9 * s)) | 1
+    joined = cv2.morphologyEx(weak, cv2.MORPH_CLOSE,
+                              cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)))
     num, labels, stats, _ = cv2.connectedComponentsWithStats(joined)
-    if num <= 1:
+    has_strong = np.bincount(labels[strong], minlength=num) > 0
+    seeds = [j for j in range(1, num) if has_strong[j] and stats[j, cv2.CC_STAT_AREA] >= 15 * s * s]
+    if not seeds:
         sys.exit("Không tự dò được watermark. Hãy dùng --box x y w h.")
-    best = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    region = (labels == best).astype(np.uint8) * 255
 
-    # Phủ kín chữ + bóng đổ
-    region = cv2.morphologyEx(region, cv2.MORPH_CLOSE,
-                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
-    # Nới rộng thêm để ăn hết viền mờ của bóng đổ
-    region = cv2.dilate(region, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)))
+    # Watermark nằm sát góc: chọn cụm có mép gần góc khung tìm nhất
+    def corner_dist(j):
+        x, y, cw, ch = stats[j, :4]
+        dx = rw - (x + cw) if "right" in corner else x
+        dy = rh - (y + ch) if "bottom" in corner else y
+        return dx + dy
+    seed = min(seeds, key=corner_dist)
+    sx, sy, sw, sh = stats[seed, :4]
+    # Gom thêm các cụm cùng hàng chữ, sát cạnh (vd. "Dola" và "AI" tách rời)
+    gap = 12 * s
+    keep = [j for j in range(1, num)
+            if stats[j, cv2.CC_STAT_AREA] >= 15 * s * s
+            and stats[j, 1] < sy + sh and stats[j, 1] + stats[j, 3] > sy
+            and stats[j, 0] < sx + sw + gap and stats[j, 0] + stats[j, 2] > sx - gap]
+    region = np.isin(labels, keep).astype(np.uint8) * 255
+
+    # Nới rộng để phủ hết viền chữ + bóng đổ
+    g = max(1, int(grow * s))
+    region = cv2.dilate(region, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * g + 1, 2 * g + 1)))
 
     mask = np.zeros((h, w), np.uint8)
     mask[ry:ry + rh, rx:rx + rw] = region
@@ -95,21 +148,16 @@ def detect_mask(path, corner, samples=40, thresh=0.7):
 
 
 def box_mask(path, x, y, bw, bh):
-    cap = cv2.VideoCapture(path)
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    cap.release()
+    w, h, _ = video_info(path)
     mask = np.zeros((h, w), np.uint8)
     mask[y:y + bh, x:x + bw] = 255
     return mask
 
 
 def process(src, dst, mask, radius, method):
+    w, h, n = video_info(src)
     cap = cv2.VideoCapture(src)
     fps = cap.get(cv2.CAP_PROP_FPS) or 24
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if method == "fsr" and not hasattr(cv2, "xphoto"):
         print("Không có cv2.xphoto (cần opencv-contrib-python) -> dùng telea.")
         method = "telea"
@@ -120,13 +168,19 @@ def process(src, dst, mask, radius, method):
     x0, x1 = max(xs.min() - pad, 0), min(xs.max() + pad + 1, w)
     y0, y1 = max(ys.min() - pad, 0), min(ys.max() + pad + 1, h)
     sub_mask = mask[y0:y1, x0:x1]
+    keep_orig = (sub_mask == 0)[..., None]
     if method == "fsr":
-        fsr_mask = 255 - sub_mask  # xphoto.inpaint: 0 = pixel cần vá
-        fsr_out = np.empty((y1 - y0, x1 - x0, 3), np.uint8)
+        # FSR lỗi màu khi mask sát mép ảnh -> thêm viền phản chiếu rồi cắt lại
+        b = 16
+        fsr_mask = cv2.copyMakeBorder(255 - sub_mask, b, b, b, b, cv2.BORDER_CONSTANT, value=255)
+        fsr_out = np.empty((y1 - y0 + 2 * b, x1 - x0 + 2 * b, 3), np.uint8)
 
         def inpaint(img):
-            cv2.xphoto.inpaint(img, fsr_mask, fsr_out, cv2.xphoto.INPAINT_FSR_FAST)
-            return fsr_out
+            big = cv2.copyMakeBorder(img, b, b, b, b, cv2.BORDER_REFLECT)
+            out = cv2.xphoto.inpaint(big, fsr_mask, fsr_out, cv2.xphoto.INPAINT_FSR_FAST)
+            out = fsr_out if out is None else out
+            # chỉ thay pixel trong mask, phần còn lại giữ nguyên ảnh gốc
+            return np.where(keep_orig, img, out[b:-b, b:-b])
     else:
         flag = cv2.INPAINT_TELEA if method == "telea" else cv2.INPAINT_NS
 
@@ -173,31 +227,52 @@ def process(src, dst, mask, radius, method):
         writer.release()
 
 
+VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v")
+
+
+def remove_one(src, dst, args):
+    print(f"== {src}")
+    if args.box:
+        mask = box_mask(src, *args.box)
+    elif args.preset == "auto":
+        mask = detect_mask(src, args.corner)
+    else:
+        p = PRESETS[args.preset]
+        mask = detect_mask(src, p["corner"], p["win"], p["grow"])
+    ys, xs = np.where(mask > 0)
+    print(f"Vùng watermark: x={xs.min()} y={ys.min()} w={xs.max() - xs.min() + 1} h={ys.max() - ys.min() + 1}")
+    if args.save_mask:
+        cv2.imwrite(args.save_mask, mask)
+    process(src, dst, mask, args.radius, args.method)
+    print(f"Xong: {dst}")
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Xóa watermark tĩnh khỏi video.")
-    ap.add_argument("input")
-    ap.add_argument("output")
+    ap = argparse.ArgumentParser(description="Xóa watermark tĩnh (Veo, Dola AI, ...) khỏi video.")
+    ap.add_argument("input", help="File video hoặc thư mục chứa video")
+    ap.add_argument("output", help="File video ra, hoặc thư mục ra nếu input là thư mục")
+    ap.add_argument("--preset", choices=("auto", *PRESETS), default="auto",
+                    help="Loại watermark: veo, dola, hoặc auto (tìm trong cả góc)")
     ap.add_argument("--box", nargs=4, type=int, metavar=("X", "Y", "W", "H"),
                     help="Chỉ định vùng watermark thủ công thay vì tự dò")
     ap.add_argument("--corner", choices=CORNERS, default="bottom-right",
-                    help="Góc chứa watermark khi tự dò (mặc định bottom-right)")
+                    help="Góc chứa watermark khi --preset auto (mặc định bottom-right)")
     ap.add_argument("--radius", type=int, default=5, help="Bán kính inpaint cho telea/ns")
     ap.add_argument("--method", choices=("fsr", "telea", "ns"), default="fsr",
                     help="fsr: giữ đường nét tốt nhất (mặc định); telea/ns: nhanh hơn")
     ap.add_argument("--save-mask", metavar="PNG", help="Lưu mask ra ảnh để kiểm tra")
     args = ap.parse_args()
 
-    if args.box:
-        mask = box_mask(args.input, *args.box)
+    if os.path.isdir(args.input):
+        os.makedirs(args.output, exist_ok=True)
+        files = sorted(f for f in os.listdir(args.input) if f.lower().endswith(VIDEO_EXTS))
+        if not files:
+            sys.exit(f"Không có video nào trong {args.input}")
+        for f in files:
+            name = os.path.splitext(f)[0] + "_clean.mp4"
+            remove_one(os.path.join(args.input, f), os.path.join(args.output, name), args)
     else:
-        mask = detect_mask(args.input, args.corner)
-    ys, xs = np.where(mask > 0)
-    print(f"Vùng watermark: x={xs.min()} y={ys.min()} w={xs.max() - xs.min() + 1} h={ys.max() - ys.min() + 1}")
-    if args.save_mask:
-        cv2.imwrite(args.save_mask, mask)
-
-    process(args.input, args.output, mask, args.radius, args.method)
-    print(f"Xong: {args.output}")
+        remove_one(args.input, args.output, args)
 
 
 if __name__ == "__main__":
