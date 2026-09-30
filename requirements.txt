@@ -1,0 +1,8 @@
+# PyTorch: cài bản đúng với GPU trước, xem https://pytorch.org/get-started/locally/
+#   NVIDIA: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+torch>=2.1
+torchvision
+spandrel>=0.4
+numpy
+pillow
+imageio-ffmpeg  # FFmpeg dự phòng nếu máy chưa có ffmpeg
